@@ -39,7 +39,15 @@ function Entities.new()
   return self
 end
 
+-- LOCAL CONSTANTS -------------------------------------------------------------
+
+local EPSILON = 1e-10
+
 -- LOCAL FUNCTIONS -------------------------------------------------------------
+
+local equals(a, b)
+  return math.abs(a - b) <= EPSILON
+end
 
 local function hash(x, y)
   local id = string.format('%d@%d', x, y)
