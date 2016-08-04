@@ -20,12 +20,14 @@ freely, subject to the following restrictions:
 
 ]]--
 
+-- https://springrts.com/wiki/Lua_Performance#TEST_3:_Unpack_A_Table
+
 -- MODULE INCLUSIONS -----------------------------------------------------------
 
 -- MODULE DECLARATION ----------------------------------------------------------
 
 local Entities = {
-  _VERSION = '0.3.0'
+  _VERSION = '0.4.0'
 }
 
 -- MODULE OBJECT CONSTRUCTOR ---------------------------------------------------
@@ -46,11 +48,14 @@ end
 
 -- MODULE FUNCTIONS ------------------------------------------------------------
 
-function Entities:initialize(comparator, grid_size, auto_resolve)
-  -- Store the entity sorting-comparator (optional).
+-- TODO: the [filter] function that enables to handle the collision
+--       resolution (returning 'touch', 'slide', 'cross' and 'bounce')
+function Entities:initialize(comparator, grid_size, filter)
+  -- Store the (optional) entity sorting-comparator, grid size and collision
+  -- resolution filter function.
   self.comparator = comparator
   self.grid_size = grid_size
-  self.auto_resolve = auto_resolve
+  self.filter = filter
 
   self:reset()
 end
@@ -58,12 +63,9 @@ end
 function Entities:reset()
   self.active = {}
   self.incoming = {}
-  self.buckets = {}
-  self.colliding = {}
 end
 
--- TODO: pass a [filter] function that enables to handle the collision
---       resolution (returning 'touch', 'slide', 'cross' and 'bounce')
+-- TODO: pass the [comparator] and [filter] here? I'm quite positive...
 function Entities:update(dt)
   -- If there are any waiting recently added entities, we merge them in the
   -- active entities list. The active list is kept sorted, if a proper
@@ -94,17 +96,11 @@ function Entities:update(dt)
     table.remove(self.active, index)
   end
 
-  -- Keep the [colliding] and [grid] attributes updated with the collision
-  -- spatial-hashmap and the current collisions list (if the "auto resolution"
-  -- flag is enabled).
-  self.buckets = {}
-  self.colliding = {}
-  if self.grid_size then
-    self.buckets = self:partition(self.grid_size)
-    if self.auto_resolve then
-      for _, entities in pairs(self.buckets) do
-        self:resolve(entities, self.colliding)
-      end
+  -- Rebuild the spatial-hashmap if needed.
+  if self.grid_size and self.filter then
+    local buckets = self:partition(self.active, self.grid_size)
+    for _, entities in pairs(buckets) do
+      self:resolve(entities, self.filter)
     end
   end
 end
@@ -129,14 +125,28 @@ function Entities:push(entity)
   -- content while we iterate.
   --
   -- We are using the "table" namespace functions since we are possibly
-  -- continously scambling the content by reordering it.
+  -- continously scrambling the content by reordering it.
   table.insert(self.incoming, entity)
 end
 
-function Entities:partition(size)
+function Entities:find(filter)
+  for _, entity in ipairs(self.active) do
+    if filter(entity) then
+      return entity
+    end
+  end
+  for _, entity in ipairs(self.incoming) do
+    if filter(entity) then
+      return entity
+    end
+  end
+  return nil
+end
+
+function Entities:partition(entities, size)
   local buckets = {}
   
-  for _, entity in ipairs(self.active) do
+  for _, entity in ipairs(entities) do
     -- If the entity does not have both the [collide] and [aabb] methods we
     -- consider it to be "ephemeral" in nature (e.g. sparkles, smoke, bubbles,
     -- etc...). It will be ignored and won't count toward collision.
@@ -165,20 +175,18 @@ function Entities:partition(size)
 
     -- Build the list of cells (IDs) to which the entity belong. Also, store
     -- the entity in the spatial-hashing table.
-    entity.cells = {}
     for id, _ in pairs(cells) do
       if not buckets[id] then -- allocate new table for new cells needed
         buckets[id] = {}
       end
       table.insert(buckets[id], entity)
-      table.insert(entity.cells, id) -- used for direct collision detection
     end
   end
 
   return buckets
 end
 
-function Entities:resolve(entities, colliding)
+function Entities:resolve(entities, filter)
   -- Naive bruteforce O(n^2) collision resolution algorithm (with no
   -- projection at all). As a minor optimization, we scan the pairing
   -- square matrix on the upper (or lower) triangle.
@@ -200,36 +208,11 @@ function Entities:resolve(entities, colliding)
     local this = entities[i]
     for j = i + 1, #entities do
       local that = entities[j]
-      if this:collide(that) then  -- TODO: should also check for "is_alive()"?
-        colliding[#colliding + 1] = { this, that }
+      if this:collide(that) then
+        filter(this, that) -- TODO: should also check for "is_alive()"?
       end
     end
   end
-end
-
-function Entities:collisions(entity) -- FIXME: useless once the filter callback is added.
-  local colliding = {}
-
-  for _, id in ipairs(entity.cells) do
-    local entities = self.grid[id]
-    self:resolve(entities, colliding)
-  end
-
-  return colliding
-end
-
-function Entities:find(filter)
-  for _, entity in ipairs(self.active) do
-    if filter(entity) then
-      return entity
-    end
-  end
-  for _, entity in ipairs(self.incoming) do
-    if filter(entity) then
-      return entity
-    end
-  end
-  return nil
 end
 
 -- END OF MODULE ---------------------------------------------------------------
