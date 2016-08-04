@@ -25,7 +25,7 @@ freely, subject to the following restrictions:
 -- MODULE DECLARATION ----------------------------------------------------------
 
 local Entities = {
-  _VERSION = '0.2.0'
+  _VERSION = '0.3.0'
 }
 
 -- MODULE OBJECT CONSTRUCTOR ---------------------------------------------------
@@ -39,12 +39,18 @@ end
 
 -- LOCAL FUNCTIONS -------------------------------------------------------------
 
+local function hash(x, y)
+  local id = string.format('%d@%d', x, y)
+  return id
+end
+
 -- MODULE FUNCTIONS ------------------------------------------------------------
 
-function Entities:initialize(comparator, grid_size)
+function Entities:initialize(comparator, grid_size, auto_resolve)
   -- Store the entity sorting-comparator (optional).
   self.comparator = comparator
   self.grid_size = grid_size
+  self.auto_resolve = auto_resolve
 
   self:reset()
 end
@@ -52,9 +58,12 @@ end
 function Entities:reset()
   self.active = {}
   self.incoming = {}
+  self.buckets = {}
   self.colliding = {}
 end
 
+-- TODO: pass a [filter] function that enables to handle the collision
+--       resolution (returning 'touch', 'slide', 'cross' and 'bounce')
 function Entities:update(dt)
   -- If there are any waiting recently added entities, we merge them in the
   -- active entities list. The active list is kept sorted, if a proper
@@ -77,7 +86,7 @@ function Entities:update(dt)
   local zombies = {}
   for index, entity in ipairs(self.active) do
     entity:update(dt)
-    if not entity:is_alive() then
+    if entity.is_alive and not entity:is_alive() then
       table.insert(zombies, 1, index);
     end
   end
@@ -85,13 +94,17 @@ function Entities:update(dt)
     table.remove(self.active, index)
   end
 
-  -- Keep the [colliding] attribute updated with the collision
-  -- list.
+  -- Keep the [colliding] and [grid] attributes updated with the collision
+  -- spatial-hashmap and the current collisions list (if the "auto resolution"
+  -- flag is enabled).
+  self.buckets = {}
   self.colliding = {}
   if self.grid_size then
-    local grid = self:partition(self.grid_size)
-    for _, entities in pairs(grid) do
-      self:resolve(entities, self.colliding)
+    self.buckets = self:partition(self.grid_size)
+    if self.auto_resolve then
+      for _, entities in pairs(self.buckets) do
+        self:resolve(entities, self.colliding)
+      end
     end
   end
 end
@@ -121,13 +134,17 @@ function Entities:push(entity)
 end
 
 function Entities:partition(size)
-  local grid = {}
+  local buckets = {}
   
   for _, entity in ipairs(self.active) do
     -- If the entity does not have both the [collide] and [aabb] methods we
     -- consider it to be "ephemeral" in nature (e.g. sparkles, smoke, bubbles,
     -- etc...). It will be ignored and won't count toward collision.
+    local cells = {}
+    
     if entity.collide and entity.aabb then
+      -- We find the belonging grid-cell for each of the entity AABB corner,
+      -- in order to deal with boundary-crossing entities. 
       local aabb = entity.aabb()
       local left, top, right, bottom = unpack(aabb)
       local coords = {
@@ -137,31 +154,28 @@ function Entities:partition(size)
             { right, bottom }
           }
 
-      -- We find the belonging grid-cell for each of the entity AABB corner,
-      -- in order to deal with boundary-crossing entities. We make sure not
-      -- to store the same entity twice in the same grid-cell.
-      local cells = {}
+      -- We make sure not to store the same entity twice in the same grid-cell
+      -- by using the cell's hash-value as a "key".
       for _, position in ipairs(coords) do
         local x, y = unpack(position)
         local gx, gy = math.floor(x / size), math.floor(y / size)
-        local id = string.format('%d@%d', gx, gy)
-        if not grid[id] then
-          grid[id] = {}
-        end
-        if not cells[id] then
-          table.insert(grid[id], entity)
-        end
-        cells[id] = true
+        cells[hash(gx, gy)] = true
       end
+    end
 
-      entity.cells = {}
-      for id, _ in pairs(cells) do
-        table.insert(entity.cells, id)
+    -- Build the list of cells (IDs) to which the entity belong. Also, store
+    -- the entity in the spatial-hashing table.
+    entity.cells = {}
+    for id, _ in pairs(cells) do
+      if not buckets[id] then -- allocate new table for new cells needed
+        buckets[id] = {}
       end
+      table.insert(buckets[id], entity)
+      table.insert(entity.cells, id) -- used for direct collision detection
     end
   end
 
-  return grid
+  return buckets
 end
 
 function Entities:resolve(entities, colliding)
@@ -181,15 +195,27 @@ function Entities:resolve(entities, colliding)
   -- http://www.java-gaming.org/index.php?topic=29244.0
   -- http://www.hobbygamedev.com/adv/2d-platformer-advanced-collision-detection/
   -- http://www.wildbunny.co.uk/blog/2011/12/14/how-to-make-a-2d-platform-game-part-2-collision-detection/
+  -- http://www.gamedev.net/page/resources/_/technical/game-programming/spatial-hashing-r2697
   for i = 1, #entities - 1 do
     local this = entities[i]
     for j = i + 1, #entities do
       local that = entities[j]
-      if this:collide(that) then
+      if this:collide(that) then  -- TODO: should also check for "is_alive()"?
         colliding[#colliding + 1] = { this, that }
       end
     end
   end
+end
+
+function Entities:collisions(entity) -- FIXME: useless once the filter callback is added.
+  local colliding = {}
+
+  for _, id in ipairs(entity.cells) do
+    local entities = self.grid[id]
+    self:resolve(entities, colliding)
+  end
+
+  return colliding
 end
 
 function Entities:find(filter)
