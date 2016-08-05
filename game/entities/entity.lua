@@ -39,6 +39,18 @@ function Entity:initialize(parameters)
   self.radius = parameters.radius
 end
 
+function Entity:move(nx, ny)
+  local x, y = unpack(self.position)
+  self.position = { nx, ny }
+  return { nx - x, ny - y }
+end
+
+function Entity:translate(dx, dy)
+  local x, y = unpack(self.position)
+  self.position = { x + dx, y + dy }
+  return { x, y }
+end
+
 function Entity:update(dt)
   -- Decrease the current life if the entity is not everlasting.
   if self.life ~= math.huge then
@@ -61,6 +73,10 @@ function Entity:is_alive()
   return self.life > 0
 end
 
+-- The entity's AABB is returned thru' a function since we might want to make
+-- it changing during time or according to particular conditions? However, this
+-- could also be accomplished with a property (updated in the [update()]
+-- callback). Still, we prefer to separate this logic.
 function Entity:aabb()
   local x, y = unpack(self.position)
   return { x - self.radius, y - self.radius, x + self.radius, y + self.radius }
