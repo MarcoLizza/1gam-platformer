@@ -45,26 +45,29 @@ local EPSILON = 1e-10
 
 -- LOCAL FUNCTIONS -------------------------------------------------------------
 
-local function intersect(a, b)
-  local ax0, ay0, ax1, ay1 = unpack(a)
-  local bx0, by0, bx1, by1 = unpack(b)
-  if ax1 < bx0 or ay1 < by0 or ax0 > bx1 or ay0 > by1 then
-    return false, {}
+local function esign(x)
+  if x <= -EPSILON then
+    return -1
+  elseif x >= EPSILON then
+    return 1
   else
-    return true, { math.max(ax0, bx0), math.max(ay0, by0), math.min(ax1, bx1), math.min(ay1, by1) }
+    return 0
   end
 end
 
---local function compare(a, b)
---  local delta = a - b
---  if delta < -EPSILON then
---    return -1
---  elseif delta > EPSILON then
---    return 1
---  else
---    return 0
---  end
---end
+-- http://hamaluik.com/posts/simple-aabb-collision-using-minkowski-difference/
+-- http://hamaluik.com/posts/swept-aabb-collision-using-minkowski-difference/
+local function minkowski(a, b)
+  local al, at, ar, ab = unpack(a)
+  local bl, bt, br, bb = unpack(a)
+  return al - br, at - bb, ar - bl, ab - bt
+end
+
+local function colliding(a, b)
+  local xl, xt, xr, xb = minkowski(a, b)
+  local colliding = esign(xl) <= 0 and esign(xr) >= 0 and esign(xt) <= 0 and esign(xb) >= 0
+  return colliding, { xl, xt, xr, xb }
+end
 
 local function hash(x, y)
   local id = string.format('%d@%d', x, y)
@@ -103,6 +106,7 @@ function Entities:update(dt, comparator, filter)
   end
   --
   local deltas = {}
+  local velocities = {}
   -- Update and keep track of the entities that need to be removed.
   --
   -- Since we need to keep the entities relative sorting, we remove "dead"
@@ -114,7 +118,9 @@ function Entities:update(dt, comparator, filter)
     local ox, oy = unpack(entity.position)
     entity:update(dt)
     local nx, ny = unpack(entity.position)
-    deltas[entity] = { nx - ox, ny - oy } -- TODO: use a "hidden" entity property?
+    local dx, dy = nx - ox, ny - oy
+    deltas[entity] = { dx, dy } -- TODO: use a "hidden" entity properties?
+    velocities[entity] = { dx / dt, dy / dt }
     
     if entity.is_alive and not entity:is_alive() then
       table.insert(zombies, 1, index);
@@ -128,7 +134,7 @@ function Entities:update(dt, comparator, filter)
   if filter then
     local buckets = self:partition(self.active, self.grid_size)
     for _, entities in pairs(buckets) do
-      self:resolve(entities, deltas, filter)
+      self:resolve(entities, deltas, velocities, filter)
     end
   end
 end
@@ -213,7 +219,7 @@ function Entities:partition(entities, size)
   return buckets
 end
 
-function Entities:resolve(entities, deltas, filter)
+function Entities:resolve(entities, deltas, velocities, filter)
   -- Naive bruteforce O(n^2) collision resolution algorithm (with no
   -- projection at all). As a minor optimization, we scan the pairing
   -- square matrix on the upper (or lower) triangle.
@@ -245,7 +251,7 @@ function Entities:resolve(entities, deltas, filter)
         -- In order to implement DEFLECT and PUSH resolutions we need the
         -- delta of the movement (or the previous position). We compute it
         -- in the [update()] callback.
-        local resolution = filter(this, that) -- TODO: should also check for "is_alive()"?
+        local resolution, nx, ny = filter(this, that) -- TODO: should also check for "is_alive()"?
         if resolution == 'deflect' then
           if width < height then
             local delta = dx > 0 and dx - width or dx + width
