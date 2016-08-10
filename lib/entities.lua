@@ -45,28 +45,140 @@ local EPSILON = 1e-10
 
 -- LOCAL FUNCTIONS -------------------------------------------------------------
 
-local function esign(x)
-  if x <= -EPSILON then
+local function edelta(a, b)
+  local delta = a - b
+  if delta <= -EPSILON then
     return -1
-  elseif x >= EPSILON then
+  elseif delta >= EPSILON then
     return 1
   else
     return 0
   end
 end
 
+local function esign(x)
+  return edelta(x, 0)
+end
+
 -- http://hamaluik.com/posts/simple-aabb-collision-using-minkowski-difference/
 -- http://hamaluik.com/posts/swept-aabb-collision-using-minkowski-difference/
 local function minkowski(a, b)
   local al, at, ar, ab = unpack(a)
-  local bl, bt, br, bb = unpack(a)
+  local bl, bt, br, bb = unpack(b)
   return al - br, at - bb, ar - bl, ab - bt
 end
 
-local function colliding(a, b)
+local function cross_product(vx, vy, wx, wy)
+  return vx * wy - vy * wx
+end
+
+-- Derived from the following code, with the simplication that the
+-- first vector origin is <0, 0>.
+-- https://github.com/pgkelley4/line-segments-intersect/blob/master/js/line-segments-intersect.js
+local function intersect(rx, ry, qx, qy, sx, sy)
+  local numerator = cross_product(qx, qy, rx, ry)
+  local denominator = cross_product(rx, ry, sx, sy)
+
+  if esign(numerator) == 0 and esign(denominator == 0) then
+    -- The lines are colinear, check if they overlap
+    -- TODO: calculate intersection point
+    return math.huge
+  end
+
+  if esign(denominator) == 0 then
+    -- The lines are parallel
+    return math.huge
+  end
+    
+  local u = numerator / denominator
+  local t = cross_product(qx, qy, sx, sy) / denominator
+  if esign(t) >= 0 and edelta(t, 1) <= 0 and esign(u) >= 0 and edelta(u, 1) <= 0 then
+    return t
+  end
+  return math.huge
+end
+
+local function colliding(a, da, b, db)
   local xl, xt, xr, xb = minkowski(a, b)
-  local colliding = esign(xl) <= 0 and esign(xr) >= 0 and esign(xt) <= 0 and esign(xb) >= 0
-  return colliding, { xl, xt, xr, xb }
+  -- If the Minkowsky AABB wraps the origin point around the two entities
+  -- are colliding.
+  if esign(xl) <= 0 and esign(xr) >= 0 and esign(xt) <= 0 and esign(xb) >= 0 then
+    return true, 0
+  else
+    -- Otherwise, calculate the relative motion between the two AABBs.
+    local adx, ady = unpack(da)
+    local bdx, bdy = unpack(db)
+    local rx, ry = adx - bdx, ady - bdy
+
+    -- Ray-cast the relative motion vector against the Minkowski AABB.
+    -- As an optimization (and simplification) we are storing the
+    -- starting point and the delta movement.
+    local segments = {
+        { xl, xt, 0, xb - xt }, -- down
+        { xl, xb, xr - xl, 0 }, -- right
+        { xr, xb, 0, xt - xb }, -- up
+        { xr, xt, xl - xr, 0 }  -- left
+      }
+    local min_h = math.huge
+    for _, segment in ipairs(segments) do
+      local qx, qy, sx, sy = unpack(segment)
+      local h = intersect(rx, ry, qx, qy, sx, sy);
+      if min_h > h then
+        min_h = h
+      end
+    end
+
+    if min_h < math.huge then
+      return true, min_h
+    else
+      return false, 1
+    end
+  end
+end
+
+local function pass(entity, h, normal)
+  local ox, oy = unpack(entity.position)
+  local dx, dy = unpack(entity.delta)
+  
+  entity.position = { ox + dx, oy + dy }
+end
+
+local function touch(entity, h, normal)
+  local ox, oy = unpack(entity.position)
+  local dx, dy = unpack(entity.delta)
+  
+  entity.position = { ox + dx * h, oy + dy * h }
+end
+
+local function deflect(entity, h, normal)
+  local ox, oy = unpack(entity.position)
+  local dx, dy = unpack(entity.delta)
+  local nx, ny = unpack(normal)
+  local x, y = ox + dx * h, oy + dy * h
+  
+  local r = 1 - h
+  
+  if esign(nx) > 0 then
+    x = x - dx * r
+  end
+  if esign(ny) > 0 then
+    y = y - dy * r
+  end
+  
+  entity.position = { x, y }
+end
+
+local function slide(entity, h, normal)
+  local ox, oy = unpack(entity.position)
+  local dx, dy = unpack(entity.delta)
+  local nx, ny = unpack(normal)
+  local x, y = ox + dx * h, oy + dy * h
+  
+  local r = 1 - h
+  
+  local dot_product = (dx * ny + dy * nx) * r
+  
+  entity.position = { x + dot_product * ny, y + dot_product * nx }
 end
 
 local function hash(x, y)
@@ -88,9 +200,6 @@ function Entities:reset()
   self.incoming = {}
 end
 
--- TODO: pass the [comparator] and [filter] here? I'm quite positive...
--- TODO: the [filter] function that enables to handle the collision
---       resolution (returning 'touch', 'slide', 'cross' and 'bounce')
 function Entities:update(dt, comparator, filter)
   -- If there are any waiting recently added entities, we merge them in the
   -- active entities list. The active list is kept sorted, if a proper
@@ -104,24 +213,25 @@ function Entities:update(dt, comparator, filter)
       table.sort(self.active, comparator)
     end
   end
-  --
-  local deltas = {}
-  local velocities = {}
+
   -- Update and keep track of the entities that need to be removed.
   --
   -- Since we need to keep the entities relative sorting, we remove "dead"
   -- entities from the back to front. To achive this we "push" the
   -- indices at the front of the to-be-removed list. That way, when
   -- we traverse it we can safely remove the elements as we go.
+  --
+  -- We are going to calulate and store the delta movement vectors for
+  -- each entity (using the [delta] property). They will come handy when
+  -- applying collision detection.
   local zombies = {}
   for index, entity in ipairs(self.active) do
     local ox, oy = unpack(entity.position)
-    entity:update(dt)
+    entity:update(dt) -- TODO: should update() return the new position? Doubtful...
     local nx, ny = unpack(entity.position)
-    local dx, dy = nx - ox, ny - oy
-    deltas[entity] = { dx, dy } -- TODO: use a "hidden" entity properties?
-    velocities[entity] = { dx / dt, dy / dt }
-    
+    entity.position = { ox, oy }
+    entity.delta = { nx - ox, ny - oy }
+
     if entity.is_alive and not entity:is_alive() then
       table.insert(zombies, 1, index);
     end
@@ -129,12 +239,12 @@ function Entities:update(dt, comparator, filter)
   for _, index in ipairs(zombies) do
     table.remove(self.active, index)
   end
-
+  
   -- Rebuild the spatial-hashmap if needed.
   if filter then
     local buckets = self:partition(self.active, self.grid_size)
     for _, entities in pairs(buckets) do
-      self:resolve(entities, deltas, velocities, filter)
+      self:resolve(entities, filter)
     end
   end
 end
@@ -190,11 +300,11 @@ function Entities:partition(entities, size)
       local aabb = entity.aabb()
       local left, top, right, bottom = unpack(aabb)
       local coords = {
-            { left, top },
-            { left, bottom },
-            { right, top },
-            { right, bottom }
-          }
+          { left, top },
+          { left, bottom },
+          { right, bottom },
+          { right, top }
+        }
 
       -- We make sure not to store the same entity twice in the same grid-cell
       -- by using the cell's hash-value as a "key".
@@ -219,7 +329,7 @@ function Entities:partition(entities, size)
   return buckets
 end
 
-function Entities:resolve(entities, deltas, velocities, filter)
+function Entities:resolve(entities, filter)
   -- Naive bruteforce O(n^2) collision resolution algorithm (with no
   -- projection at all). As a minor optimization, we scan the pairing
   -- square matrix on the upper (or lower) triangle.
@@ -239,37 +349,24 @@ function Entities:resolve(entities, deltas, velocities, filter)
   -- http://www.gamedev.net/page/resources/_/technical/game-programming/spatial-hashing-r2697
   for i = 1, #entities - 1 do
     local this = entities[i]
-    local dx, dy = unpack(deltas[this])
     for j = i + 1, #entities do
       local that = entities[j]
-      -- TODO: this is too naive! We should project the movement and find the
-      --       moment of impact, to solve tunneling issues!
-      local collide, area = intersect(this.aabb(), that.aabb())
+      local collide, h = colliding(this.aabb(), this.delta, that.aabb(), that.delta)
       if collide then
-        local left, top, right, bottom = unpack(area)
-        local width, height = right - left, bottom - top
-        -- In order to implement DEFLECT and PUSH resolutions we need the
-        -- delta of the movement (or the previous position). We compute it
-        -- in the [update()] callback.
-        local resolution, nx, ny = filter(this, that) -- TODO: should also check for "is_alive()"?
+        local resolution, normal = filter(this, that) -- TODO: should also check for "is_alive()"?
         if resolution == 'deflect' then
-          if width < height then
-            local delta = dx > 0 and dx - width or dx + width
-            this:translate(-delta * 2, 0)
-          else
-            local delta = dy > 0 and dy - height or dy + height
-            this:translate(0, -delta * 2)
-          end
+          deflect(this, h, normal)
+          deflect(that, h, normal)
         elseif resolution == 'slide' then
-          -- Move back along the smaller direction of movement (use deltas?).
-          if width < height then
-            this:translate(dx > 0 and -width or width, 0)
-          else
-            this:translate(0, dy > 0 and -height or height)
-          end
+          slide(this, h, normal)
+          slide(that, h, normal)
+        elseif resolution == 'pass' then
+          pass(this, h, normal)
+          pass(that, h, normal)
         elseif resolution == 'touch' then
-          this:translate(dx > 0 and -width or width, dy > 0 and -height or height)
-        end
+          touch(this, h, normal)
+          touch(that, h, normal)
+        end -- FIXME: what's the default?
       end
     end
   end
